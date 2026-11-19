@@ -457,13 +457,9 @@ impl ChatMarkers {
     /// harmony low|medium|high (default medium). An unknown value falls
     /// back to that style's default rather than reaching the prompt.
     pub fn set_reasoning(&mut self, level: &str) {
-        self.reasoning = match (self.style, level) {
-            (ChatStyle::Glm, "high") => "high",
-            (ChatStyle::Glm, _) => "max",
-            (_, "low") => "low",
-            (_, "high") => "high",
-            (_, _) => "medium",
-        };
+        self.reasoning = self.reasoning_levels().iter().copied()
+            .find(|&supported| supported == level)
+            .unwrap_or_else(|| self.reasoning_default());
     }
 
     /// True when the assistant opener leaves a reasoning block OPEN, so
@@ -479,7 +475,7 @@ impl ChatMarkers {
     pub fn reasoning_capable(&self) -> bool {
         matches!(
             self.style,
-            ChatStyle::Glm | ChatStyle::Harmony | ChatStyle::Laguna
+            ChatStyle::Glm | ChatStyle::Harmony | ChatStyle::Laguna | ChatStyle::KimiK3
         )
     }
 
@@ -511,6 +507,10 @@ impl ChatMarkers {
 
     /// Conversation prologue: bos for most styles, [gMASK]<sop> for GLM.
     pub fn prologue(&self) -> Vec<u32> {
+        // K3's reference encoder (build_chat_segments) emits no BOS.
+        if self.style == ChatStyle::KimiK3 {
+            return Vec::new();
+        }
         let mut v: Vec<u32> = self.bos.into_iter().collect();
         if self.style == ChatStyle::Glm {
             v.push(self.aux1);
@@ -520,9 +520,24 @@ impl ChatMarkers {
 
     /// GLM states its reasoning budget in a system block right after the
     /// prologue and before tools, capitalized, and only when thinking is
-    /// on - matching `<|system|>Reasoning Effort: {{ effort | capitalize }}`
-    /// in the shipped template. Empty for every other style.
+    /// on. K3 encodes the effort as a typed XTML system message.
     pub fn prologue_effort(&self, t: &Tokenizer) -> Vec<u32> {
+        if self.style == ChatStyle::KimiK3 {
+            if !self.think {
+                return Vec::new();
+            }
+            let mut v = self.k3_open(t, "message role=\"system\" type=\"thinking-effort\"");
+            v.extend(t.encode(&format!(
+                "`thinking_effort` guides on how much to think in your thinking channel \
+                 (not including the response channel), supported values include `low`, \
+                 `medium`, `high`, and `max`.\nNow the system is invoked with \
+                 `thinking_effort={}`.",
+                self.reasoning
+            )));
+            v.extend(self.k3_close(t, "message"));
+            v.push(self.aux1); // <|end_of_msg|>
+            return v;
+        }
         if self.style != ChatStyle::Glm || !self.think {
             return Vec::new();
         }
@@ -762,6 +777,19 @@ impl ChatMarkers {
 
     /// A completed assistant turn from history (opener + content + stop).
     pub fn render_assistant_history(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
+        if self.style == ChatStyle::KimiK3 {
+            let mut v = self.k3_open(t, "message role=\"assistant\"");
+            if self.think {
+                v.extend(self.k3_open(t, "think"));
+                v.extend(self.k3_close(t, "think"));
+            }
+            v.extend(self.k3_open(t, "response"));
+            v.extend(t.encode(text));
+            v.extend(self.k3_close(t, "response"));
+            v.extend(self.k3_close(t, "message"));
+            v.push(self.aux1); // <|end_of_msg|>
+            return v;
+        }
         if self.style == ChatStyle::Inkling {
             // history closes with <|end_message|>, not the sampling stop
             let mut v = vec![self.assistant, self.aux1];
@@ -781,7 +809,12 @@ impl ChatMarkers {
             v.push(self.aux1);
             return v;
         }
-        let mut v = self.open_assistant(t);
+        let mut v = if self.style == ChatStyle::Laguna {
+            // History contains the final answer, even when the next turn opens in think.
+            vec![self.assistant, self.aux1]
+        } else {
+            self.open_assistant(t)
+        };
         v.extend(t.encode(text));
         if self.style == ChatStyle::Glm {
             return v; // next role token delimits the turn
@@ -801,6 +834,11 @@ impl ChatMarkers {
     }
 
     pub fn is_stop(&self, id: u32) -> bool {
+        // K3 with thinking on: the first <|close|> ends `think`, not the
+        // answer, so only <|end_of_msg|>/eos may stop the turn.
+        if self.style == ChatStyle::KimiK3 && self.think && id == self.assistant {
+            return false;
+        }
         id == self.eos || Some(id) == self.eot || self.stops.binary_search(&id).is_ok()
     }
 

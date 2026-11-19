@@ -38,6 +38,8 @@ usage: pulsar-cli -m MODEL.gguf [-p TEXT | -f FILE | --tokens IDS] [options]
   --system TEXT        system prompt for --chat
   --jinja-chat         encode with the Jinja chat template instead of the
                        built-in markers (network blocked by PULSAR_OFFLINE)
+  PULSAR_THINK=1       use this model's default reasoning effort in chat
+                       or name a supported level; unset, 0, or off uses normal defaults
   --temp F, --top-p F, --min-p F, --seed N
                        sampling (defaults from general.sampling.* metadata)
 
@@ -102,6 +104,7 @@ fn encode_chat_jinja(
     tok: &tokenizer::Tokenizer,
     template: &tokenizer::ResolvedChatTemplate,
     messages: &[tokenizer::ChatMessage],
+    template_kwargs: Option<&serde_json::Value>,
 ) -> Result<Vec<u32>, String> {
     let bos = tok.bos_id.and_then(|id| tok.token_str(id));
     let eos = tok.eos_id.and_then(|id| tok.token_str(id));
@@ -111,7 +114,7 @@ fn encode_chat_jinja(
         true,
         bos,
         eos,
-        None,
+        template_kwargs,
     )
     .map_err(|e| e.to_string())?;
     if std::env::var_os("PULSAR_DEBUG_CHAT").is_some() {
@@ -136,7 +139,7 @@ fn run_chat(
 ) -> engine::Result {
     use std::io::BufRead;
 
-    let markers = match tokenizer::ChatMarkers::resolve(tok) {
+    let mut markers = match tokenizer::ChatMarkers::resolve(tok) {
         Ok(m) => m,
         Err(e) => {
             if chat_template.is_some() {
@@ -152,6 +155,34 @@ fn run_chat(
             }
         }
     };
+    let mut template_kwargs = None;
+    if let Some(setting) = std::env::var_os("PULSAR_THINK") {
+        let setting = setting.to_str().ok_or("invalid UTF-8 in PULSAR_THINK")?;
+        if !matches!(setting, "0" | "off") {
+            if !markers.reasoning_capable() && chat_template.is_none() {
+                return Err("this chat style has no supported reasoning control".into());
+            }
+            let levels = markers.reasoning_levels();
+            let effort = match setting {
+                "1" | "on" => (!levels.is_empty()).then(|| markers.reasoning_default()),
+                level if levels.contains(&level) => Some(level),
+                _ => return Err(format!(
+                    "unsupported PULSAR_THINK={setting:?}; use 1/on, 0/off, or a level from {levels:?}"
+                ).into()),
+            };
+            markers.set_think(true);
+            let mut kwargs = serde_json::json!({"enable_thinking": true, "thinking": true});
+            if let Some(level) = effort {
+                markers.set_reasoning(level);
+                kwargs["reasoning_effort"] = level.into();
+                kwargs["thinking_effort"] = level.into();
+                eprintln!("pulsar chat: thinking on (effort {level})");
+            } else {
+                eprintln!("pulsar chat: thinking requested");
+            }
+            template_kwargs = Some(kwargs);
+        }
+    }
     // sampling defaults from the gguf's own metadata (Hy3 ships 0.9/1.0)
     let meta_f = |k: &str, d: f32| {
         model.gguf.metadata.get(k).and_then(gguf::Value::as_f32).unwrap_or(d)
@@ -205,7 +236,7 @@ fn run_chat(
                 role: "user".into(),
                 content: line.to_string(),
             });
-            match encode_chat_jinja(tok, tmpl, &history) {
+            match encode_chat_jinja(tok, tmpl, &history, template_kwargs.as_ref()) {
                 Ok(ids) => {
                     // Full re-prefill each turn so assistant history is
                     // template-faithful (token stream may not match a pure

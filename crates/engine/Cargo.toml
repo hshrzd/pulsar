@@ -6,6 +6,7 @@ license.workspace = true
 description = "hy-v3 forward graph and decode loop over the pulsar CUDA kernels."
 
 [dependencies]
+serde_json = "1"
 gguf = { path = "../gguf" }
 kernels = { path = "../kernels" }
 quant = { path = "../quant" }
